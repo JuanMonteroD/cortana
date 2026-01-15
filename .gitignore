@@ -1,0 +1,17 @@
+# Entornos
+.venv/
+__pycache__/
+*.pyc
+
+# Secretos
+.env
+
+# Base de datos y export
+data/
+*.db
+*.sqlite
+*.csv
+
+# SO
+.DS_Store
+Thumbs.db
