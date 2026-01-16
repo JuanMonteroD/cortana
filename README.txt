@@ -1,8 +1,8 @@
 1) Crea un archivo .env en la raiz del proyecto con:
 
-TELEGRAM_BOT_TOKEN=8597817394:AAFlQDE5hchdJsiosgL7iB0Q02DUivi4-NM
-OWNER_TELEGRAM_USER_ID=6213634059
-DB_PATH=data/assistant.db
+TELEGRAM_BOT_TOKEN=8597817394:
+OWNER_TELEGRAM_USER_ID=
+DB_PATH=
 
 2) Instala dependencias:
 python -m pip install -r requirements.txt
