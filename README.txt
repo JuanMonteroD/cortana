@@ -1,7 +1,7 @@
 1) Crea un archivo .env en la raiz del proyecto con:
 
-TELEGRAM_BOT_TOKEN=TU_TOKEN
-OWNER_TELEGRAM_USER_ID=TU_ID_NUMERICO
+TELEGRAM_BOT_TOKEN=8597817394:AAFlQDE5hchdJsiosgL7iB0Q02DUivi4-NM
+OWNER_TELEGRAM_USER_ID=6213634059
 DB_PATH=data/assistant.db
 
 2) Instala dependencias:
