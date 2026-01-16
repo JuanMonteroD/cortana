@@ -1,265 +1,256 @@
 from __future__ import annotations
 
-import os
 import sqlite3
-from dataclasses import dataclass
-from datetime import datetime, date
-from typing import Optional, Iterable
-
-SCHEMA_SQL = """
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS usuarios (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  telegram_user_id INTEGER NOT NULL UNIQUE,
-  telegram_chat_id INTEGER,
-  nombre TEXT,
-  creado_en TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS configuracion (
-  user_id INTEGER PRIMARY KEY,
-  hora_manana TEXT NOT NULL,
-  hora_tarde TEXT NOT NULL,
-  hora_noche TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES usuarios(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS tareas (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  fecha_objetivo TEXT NOT NULL,         -- YYYY-MM-DD
-  texto TEXT NOT NULL,
-  estado TEXT NOT NULL CHECK(estado IN ('pendiente','hecho')),
-  creado_en TEXT NOT NULL,
-  hecho_en TEXT,
-  FOREIGN KEY(user_id) REFERENCES usuarios(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_tareas_user_fecha ON tareas(user_id, fecha_objetivo);
-CREATE INDEX IF NOT EXISTS idx_tareas_user_estado ON tareas(user_id, estado);
-
-CREATE TABLE IF NOT EXISTS notas (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  fecha TEXT NOT NULL,                  -- ISO datetime
-  texto TEXT NOT NULL,
-  tags_opcional TEXT,
-  creado_en TEXT NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES usuarios(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_notas_user_fecha ON notas(user_id, fecha);
-"""
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 
-@dataclass(frozen=True)
-class UserRow:
-    id: int
-    telegram_user_id: int
-    telegram_chat_id: Optional[int]
-    nombre: Optional[str]
-    creado_en: str
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-@dataclass(frozen=True)
-class ConfigRow:
-    user_id: int
-    hora_manana: str
-    hora_tarde: str
-    hora_noche: str
-
-
-def _ensure_parent_dir(db_path: str) -> None:
-    parent = os.path.dirname(db_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-
-def connect(db_path: str) -> sqlite3.Connection:
-    _ensure_parent_dir(db_path)
-    con = sqlite3.connect(db_path)
+def connect(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     return con
 
 
 def init_db(con: sqlite3.Connection) -> None:
-    con.executescript(SCHEMA_SQL)
+    cur = con.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_user_id INTEGER UNIQUE NOT NULL,
+        telegram_chat_id INTEGER,
+        name TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        target_date TEXT NOT NULL,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL, -- pending/done
+        created_at TEXT NOT NULL,
+        done_at TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        note_datetime TEXT NOT NULL,
+        text TEXT NOT NULL,
+        tags TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    """)
+
+    # Tabla minimalista para recordatorios
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        message TEXT NOT NULL,
+        schedule TEXT NOT NULL,
+        timezone TEXT NOT NULL DEFAULT 'America/Bogota',
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_run_at TEXT,
+        next_run_at TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_reminders_user_active ON reminders(user_id, active)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user_date_status ON tasks(user_id, target_date, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_notes_user_datetime ON notes(user_id, note_datetime)")
+
     con.commit()
 
 
-def get_or_create_user(con: sqlite3.Connection, telegram_user_id: int, nombre: str | None) -> UserRow:
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    cur = con.execute("SELECT * FROM usuarios WHERE telegram_user_id = ?", (telegram_user_id,))
+# ---------------- USERS ----------------
+
+def upsert_user(con: sqlite3.Connection, telegram_user_id: int, chat_id: int, name: str) -> int:
+    cur = con.cursor()
+    cur.execute("SELECT id FROM users WHERE telegram_user_id=?", (telegram_user_id,))
     row = cur.fetchone()
     if row:
-        return UserRow(
-            id=row["id"],
-            telegram_user_id=row["telegram_user_id"],
-            telegram_chat_id=row["telegram_chat_id"],
-            nombre=row["nombre"],
-            creado_en=row["creado_en"],
+        cur.execute(
+            "UPDATE users SET telegram_chat_id=?, name=? WHERE telegram_user_id=?",
+            (chat_id, name, telegram_user_id),
         )
+        con.commit()
+        return int(row["id"])
 
-    con.execute(
-        "INSERT INTO usuarios (telegram_user_id, telegram_chat_id, nombre, creado_en) VALUES (?,?,?,?)",
-        (telegram_user_id, None, nombre, now),
+    cur.execute(
+        "INSERT INTO users(telegram_user_id, telegram_chat_id, name, created_at) VALUES (?,?,?,?)",
+        (telegram_user_id, chat_id, name, now_iso()),
     )
     con.commit()
-    return get_or_create_user(con, telegram_user_id, nombre)
+    return int(cur.lastrowid)
 
 
-def set_chat_id(con: sqlite3.Connection, telegram_user_id: int, chat_id: int) -> None:
-    con.execute("UPDATE usuarios SET telegram_chat_id = ? WHERE telegram_user_id = ?", (chat_id, telegram_user_id))
-    con.commit()
+def get_user_id(con: sqlite3.Connection, telegram_user_id: int) -> Optional[int]:
+    cur = con.cursor()
+    cur.execute("SELECT id FROM users WHERE telegram_user_id=?", (telegram_user_id,))
+    row = cur.fetchone()
+    return int(row["id"]) if row else None
 
 
-def get_user_by_telegram(con: sqlite3.Connection, telegram_user_id: int) -> Optional[UserRow]:
-    cur = con.execute("SELECT * FROM usuarios WHERE telegram_user_id = ?", (telegram_user_id,))
+def get_user_chat_id(con: sqlite3.Connection, user_id: int) -> Optional[int]:
+    cur = con.cursor()
+    cur.execute("SELECT telegram_chat_id FROM users WHERE id=?", (user_id,))
     row = cur.fetchone()
     if not row:
         return None
-    return UserRow(
-        id=row["id"],
-        telegram_user_id=row["telegram_user_id"],
-        telegram_chat_id=row["telegram_chat_id"],
-        nombre=row["nombre"],
-        creado_en=row["creado_en"],
+    return row["telegram_chat_id"]
+
+
+# ---------------- TASKS/NOTES (MVP) ----------------
+
+def add_task(con: sqlite3.Connection, user_id: int, target_date: str, text: str) -> int:
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO tasks(user_id, target_date, text, status, created_at) VALUES (?,?,?,?,?)",
+        (user_id, target_date, text.strip(), "pending", now_iso()),
     )
+    con.commit()
+    return int(cur.lastrowid)
 
 
-def get_config(con: sqlite3.Connection, user_id: int) -> Optional[ConfigRow]:
-    cur = con.execute("SELECT * FROM configuracion WHERE user_id = ?", (user_id,))
+def mark_task_done_by_text(con: sqlite3.Connection, user_id: int, text: str) -> bool:
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id FROM tasks WHERE user_id=? AND status='pending' AND text=? ORDER BY id DESC LIMIT 1",
+        (user_id, text.strip()),
+    )
     row = cur.fetchone()
     if not row:
-        return None
-    return ConfigRow(
-        user_id=row["user_id"],
-        hora_manana=row["hora_manana"],
-        hora_tarde=row["hora_tarde"],
-        hora_noche=row["hora_noche"],
-    )
-
-
-def upsert_config(con: sqlite3.Connection, user_id: int, hora_manana: str, hora_tarde: str, hora_noche: str) -> None:
-    con.execute(
-        """
-        INSERT INTO configuracion (user_id, hora_manana, hora_tarde, hora_noche)
-        VALUES (?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          hora_manana=excluded.hora_manana,
-          hora_tarde=excluded.hora_tarde,
-          hora_noche=excluded.hora_noche
-        """,
-        (user_id, hora_manana, hora_tarde, hora_noche),
+        return False
+    cur.execute(
+        "UPDATE tasks SET status='done', done_at=? WHERE id=?",
+        (now_iso(), int(row["id"])),
     )
     con.commit()
+    return True
 
 
-def add_task(con: sqlite3.Connection, user_id: int, fecha_objetivo: date, texto: str) -> None:
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    con.execute(
-        "INSERT INTO tareas (user_id, fecha_objetivo, texto, estado, creado_en, hecho_en) VALUES (?,?,?,?,?,NULL)",
-        (user_id, fecha_objetivo.isoformat(), texto, "pendiente", now),
-    )
-    con.commit()
-
-
-def mark_done_or_create(con: sqlite3.Connection, user_id: int, fecha_objetivo: date, texto: str) -> None:
-    # Intenta marcar como hecho una tarea pendiente “parecida” hoy.
-    cur = con.execute(
-        """
-        SELECT id FROM tareas
-        WHERE user_id=? AND fecha_objetivo=? AND estado='pendiente' AND lower(texto) LIKE ?
-        ORDER BY id DESC LIMIT 1
-        """,
-        (user_id, fecha_objetivo.isoformat(), f"%{texto.lower()}%"),
-    )
-    row = cur.fetchone()
-    now = datetime.utcnow().isoformat(timespec="seconds")
-
-    if row:
-        con.execute(
-            "UPDATE tareas SET estado='hecho', hecho_en=? WHERE id=?",
-            (now, row["id"]),
+def list_tasks(con: sqlite3.Connection, user_id: int, target_date: str, status: Optional[str]) -> List[Dict[str, Any]]:
+    cur = con.cursor()
+    if status:
+        cur.execute(
+            "SELECT * FROM tasks WHERE user_id=? AND target_date=? AND status=? ORDER BY id DESC",
+            (user_id, target_date, status),
         )
     else:
-        con.execute(
-            "INSERT INTO tareas (user_id, fecha_objetivo, texto, estado, creado_en, hecho_en) VALUES (?,?,?,?,?,?)",
-            (user_id, fecha_objetivo.isoformat(), texto, "hecho", now, now),
+        cur.execute(
+            "SELECT * FROM tasks WHERE user_id=? AND target_date=? ORDER BY id DESC",
+            (user_id, target_date),
         )
-    con.commit()
+    return [dict(r) for r in cur.fetchall()]
 
 
-def add_note(con: sqlite3.Connection, user_id: int, when_iso: str, texto: str) -> None:
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    con.execute(
-        "INSERT INTO notas (user_id, fecha, texto, tags_opcional, creado_en) VALUES (?,?,?,?,?)",
-        (user_id, when_iso, texto, None, now),
+def add_note(con: sqlite3.Connection, user_id: int, note_datetime: str, text: str, tags: Optional[str] = None) -> int:
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO notes(user_id, note_datetime, text, tags, created_at) VALUES (?,?,?,?,?)",
+        (user_id, note_datetime, text.strip(), tags, now_iso()),
     )
     con.commit()
+    return int(cur.lastrowid)
 
 
-def list_tasks(con: sqlite3.Connection, user_id: int, fecha_objetivo: date, estado: str, limit: int = 20) -> list[str]:
-    cur = con.execute(
+def list_notes_by_date(con: sqlite3.Connection, user_id: int, yyyy_mm_dd: str) -> List[Dict[str, Any]]:
+    cur = con.cursor()
+    cur.execute(
+        "SELECT * FROM notes WHERE user_id=? AND substr(note_datetime,1,10)=? ORDER BY note_datetime DESC",
+        (user_id, yyyy_mm_dd),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def search_all(con: sqlite3.Connection, user_id: int, needle: str) -> Dict[str, List[Dict[str, Any]]]:
+    n = f"%{needle.strip()}%"
+    cur = con.cursor()
+    cur.execute("SELECT * FROM tasks WHERE user_id=? AND text LIKE ? ORDER BY id DESC LIMIT 25", (user_id, n))
+    tasks = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT * FROM notes WHERE user_id=? AND text LIKE ? ORDER BY id DESC LIMIT 25", (user_id, n))
+    notes = [dict(r) for r in cur.fetchall()]
+    return {"tasks": tasks, "notes": notes}
+
+
+# ---------------- REMINDERS (Minimalista) ----------------
+
+def create_reminder(con: sqlite3.Connection, user_id: int, name: str, message: str, schedule: str, timezone: str = "America/Bogota") -> int:
+    cur = con.cursor()
+    now = now_iso()
+    cur.execute(
         """
-        SELECT texto FROM tareas
-        WHERE user_id=? AND fecha_objetivo=? AND estado=?
-        ORDER BY id DESC LIMIT ?
+        INSERT INTO reminders(user_id, name, message, schedule, timezone, active, created_at, updated_at)
+        VALUES (?,?,?,?,?,1,?,?)
         """,
-        (user_id, fecha_objetivo.isoformat(), estado, limit),
+        (user_id, name.strip(), message.strip(), schedule.strip(), timezone.strip(), now, now),
     )
-    return [r["texto"] for r in cur.fetchall()]
+    con.commit()
+    return int(cur.lastrowid)
 
 
-def list_notes_today(con: sqlite3.Connection, user_id: int, day: date, limit: int = 20) -> list[str]:
-    # notas.fecha es ISO datetime; filtramos por prefijo YYYY-MM-DD
-    prefix = day.isoformat()
-    cur = con.execute(
-        """
-        SELECT texto FROM notas
-        WHERE user_id=? AND substr(fecha,1,10)=?
-        ORDER BY id DESC LIMIT ?
-        """,
-        (user_id, prefix, limit),
+def update_reminder_active(con: sqlite3.Connection, user_id: int, reminder_id: int, active: int) -> bool:
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE reminders SET active=?, updated_at=? WHERE id=? AND user_id=?",
+        (1 if active else 0, now_iso(), reminder_id, user_id),
     )
-    return [r["texto"] for r in cur.fetchall()]
+    con.commit()
+    return cur.rowcount > 0
 
 
-def search_everything(con: sqlite3.Connection, user_id: int, term: str, limit: int = 20) -> dict[str, list[str]]:
-    t = term.lower().strip()
-    like = f"%{t}%"
+def delete_reminder(con: sqlite3.Connection, user_id: int, reminder_id: int) -> bool:
+    cur = con.cursor()
+    cur.execute("DELETE FROM reminders WHERE id=? AND user_id=?", (reminder_id, user_id))
+    con.commit()
+    return cur.rowcount > 0
 
-    cur_t = con.execute(
-        """
-        SELECT fecha_objetivo, estado, texto FROM tareas
-        WHERE user_id=? AND lower(texto) LIKE ?
-        ORDER BY id DESC LIMIT ?
-        """,
-        (user_id, like, limit),
+
+def get_reminder(con: sqlite3.Connection, user_id: int, reminder_id: int) -> Optional[Dict[str, Any]]:
+    cur = con.cursor()
+    cur.execute("SELECT * FROM reminders WHERE id=? AND user_id=?", (reminder_id, user_id))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def get_reminder_by_id(con: sqlite3.Connection, reminder_id: int) -> Optional[Dict[str, Any]]:
+    cur = con.cursor()
+    cur.execute("SELECT * FROM reminders WHERE id=?", (reminder_id,))
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def list_reminders(con: sqlite3.Connection, user_id: int, only_active: bool = False) -> List[Dict[str, Any]]:
+    cur = con.cursor()
+    if only_active:
+        cur.execute("SELECT * FROM reminders WHERE user_id=? AND active=1 ORDER BY id DESC", (user_id,))
+    else:
+        cur.execute("SELECT * FROM reminders WHERE user_id=? ORDER BY id DESC", (user_id,))
+    return [dict(r) for r in cur.fetchall()]
+
+
+def update_reminder_run_times(con: sqlite3.Connection, reminder_id: int, last_run_at: Optional[str], next_run_at: Optional[str]) -> None:
+    cur = con.cursor()
+    cur.execute(
+        "UPDATE reminders SET last_run_at=COALESCE(?, last_run_at), next_run_at=?, updated_at=? WHERE id=?",
+        (last_run_at, next_run_at, now_iso(), reminder_id),
     )
-    tareas = [f"{r['fecha_objetivo']} · {r['estado']} · {r['texto']}" for r in cur_t.fetchall()]
-
-    cur_n = con.execute(
-        """
-        SELECT fecha, texto FROM notas
-        WHERE user_id=? AND lower(texto) LIKE ?
-        ORDER BY id DESC LIMIT ?
-        """,
-        (user_id, like, limit),
-    )
-    notas = [f"{r['fecha']} · {r['texto']}" for r in cur_n.fetchall()]
-
-    return {"tareas": tareas, "notas": notas}
-
-
-def fetch_all_for_export(con: sqlite3.Connection, user_id: int) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
-    cur_t = con.execute(
-        "SELECT fecha_objetivo, texto, estado, creado_en, hecho_en FROM tareas WHERE user_id=? ORDER BY id ASC",
-        (user_id,),
-    )
-    cur_n = con.execute(
-        "SELECT fecha, texto, creado_en FROM notas WHERE user_id=? ORDER BY id ASC",
-        (user_id,),
-    )
-    return (cur_t.fetchall(), cur_n.fetchall())
+    con.commit()

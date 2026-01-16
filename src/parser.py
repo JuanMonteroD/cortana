@@ -1,49 +1,25 @@
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
-from typing import Optional
+from datetime import date
+from typing import Optional, Tuple
 
-PREFIX_RE = re.compile(r"^\s*(hice|pendiente|nota|mañana)\s*:\s*(.+)\s*$", re.IGNORECASE)
-BUSCAR_RE = re.compile(r"^\s*buscar\s*:\s*(.+)\s*$", re.IGNORECASE)
 
-@dataclass(frozen=True)
-class Parsed:
-    kind: str
-    payload: str
-
-def parse_message(text: str) -> Optional[Parsed]:
-    if not text:
+def parse_hhmm(text: str) -> Optional[Tuple[int, int]]:
+    t = text.strip()
+    if len(t) != 5 or t[2] != ":":
         return None
-
-    clean = text.strip()
-
-    if clean.lower() in {"resumen", "/resumen"}:
-        return Parsed(kind="resumen", payload="")
-    if clean.lower() in {"pendientes", "pendiente"}:
-        return Parsed(kind="pendientes", payload="")
-    if clean.lower() in {"hechos hoy", "hechos"}:
-        return Parsed(kind="hechos_hoy", payload="")
-
-    m = BUSCAR_RE.match(clean)
-    if m:
-        return Parsed(kind="buscar", payload=m.group(1).strip())
-
-    m = PREFIX_RE.match(clean)
-    if m:
-        k = m.group(1).lower()
-        payload = m.group(2).strip()
-        # normaliza "mañana"
-        if k == "mañana":
-            k = "manana"
-        return Parsed(kind=k, payload=payload)
-
-    return None
-
-
-def parse_hhmm(s: str) -> Optional[tuple[int, int]]:
-    s = s.strip()
-    m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", s)
-    if not m:
+    hh, mm = t.split(":")
+    if not (hh.isdigit() and mm.isdigit()):
         return None
-    return int(m.group(1)), int(m.group(2))
+    h = int(hh)
+    m = int(mm)
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return h, m
+
+
+def parse_yyyy_mm_dd(text: str) -> Optional[date]:
+    try:
+        return date.fromisoformat(text.strip())
+    except Exception:
+        return None

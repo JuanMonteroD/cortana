@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
-import pytz
+from datetime import datetime, timedelta, date
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (
@@ -10,299 +10,406 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters,
     Defaults,
-    JobQueue,
+    filters,
 )
 
-from config import get_settings
+from zoneinfo import ZoneInfo
+
 import db as dbmod
-from parser import parse_message, parse_hhmm
-from reminders import (
-    TZ,
-    ReminderTimes,
-    DEFAULT_MORNING,
-    DEFAULT_AFTERNOON,
-    DEFAULT_NIGHT,
-    reschedule_user_reminders,
-)
-from export_csv import build_export_csv
+from config import get_settings
+from export_csv import export_user_data_to_csv
+from parser import parse_hhmm
+import reminders as remmod
+
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("asistente")
+log = logging.getLogger("cortana")
 
 
-def is_owner(settings, update: Update) -> bool:
+TZ = ZoneInfo("America/Bogota")
+
+
+def is_owner(update: Update, owner_id: int) -> bool:
     u = update.effective_user
-    return bool(u and u.id == settings.owner_user_id)
+    return bool(u and u.id == owner_id)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Ocurrió un error:", exc_info=context.error)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
-    if not is_owner(settings, update):
-        await update.message.reply_text("⛔ Este bot es privado.")
+    con = context.application.bot_data["db"]
+
+    if not is_owner(update, settings.owner_telegram_user_id):
+        await update.message.reply_text("Este bot es privado.")
         return
 
-    con = context.application.bot_data["db"]
-    user = dbmod.get_or_create_user(con, update.effective_user.id, update.effective_user.full_name)
-    dbmod.set_chat_id(con, update.effective_user.id, update.effective_chat.id)
+    user = update.effective_user
+    chat = update.effective_chat
+    name = (user.full_name or "Juan David").strip()
 
-    # Config por defecto si no existe
-    cfg = dbmod.get_config(con, user.id)
-    if not cfg:
-        dbmod.upsert_config(con, user.id, DEFAULT_MORNING, DEFAULT_AFTERNOON, DEFAULT_NIGHT)
-        cfg = dbmod.get_config(con, user.id)
-
-    # Re-programar recordatorios
-    reschedule_user_reminders(
-        context.application,
-        user_id=user.id,
-        chat_id=update.effective_chat.id,
-        times=ReminderTimes(cfg.hora_manana, cfg.hora_tarde, cfg.hora_noche),
-    )
+    user_id = dbmod.upsert_user(con, user.id, chat.id, name)
 
     await update.message.reply_text(
         "✅ Lista, Juan David. Ya estoy conectada a este chat.\n\n"
-        "Ejemplos rápidos:\n"
+        "Recordatorios (nuevo):\n"
+        "• /rem_add WEEKDAY@23:00 Dormir | Hora de dormir 😴\n"
+        "• /rem_add WEEKEND@10:00 Dormir | A dormir 😴\n"
+        "• /rem_add DAYS@tue@20:00 Basura | Sacar la basura 🗑️\n"
+        "• /rem_add ONCE@2026-01-20@09:00 Cita | Cita médica 🏥\n"
+        "• /rem_list /rem_off <id> /rem_on <id> /rem_del <id>\n"
+        "• /rem_test\n\n"
+        "Tareas/Notas:\n"
         "• Pendiente: estudiar 1 hora\n"
         "• Mañana: pagar recibo\n"
         "• Hice: estudiar 1 hora\n"
         "• Nota: me sentí cansado\n"
-        "• Resumen / Pendientes / Hechos hoy\n"
-        "• Buscar: palabra\n\n"
-        "Config horarios:\n"
-        "• /config 08:00 14:00 21:30\n"
+        "• Resumen / Pendientes / Hechos hoy / Buscar: palabra\n"
         "Export:\n"
         "• /export"
     )
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ---------------- Reminders Commands ----------------
+
+async def cmd_rem_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
-    if not is_owner(settings, update):
-        await update.message.reply_text("⛔ Este bot es privado.")
-        return
-
-    await update.message.reply_text(
-        "Comandos:\n"
-        "/start\n"
-        "/config HH:MM HH:MM HH:MM  (mañana tarde noche)\n"
-        "/export\n\n"
-        "Mensajes:\n"
-        "Pendiente: ...\n"
-        "Mañana: ...\n"
-        "Hice: ...\n"
-        "Nota: ...\n"
-        "Resumen | Pendientes | Hechos hoy\n"
-        "Buscar: palabra"
-    )
-
-
-async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = context.application.bot_data["settings"]
-    if not is_owner(settings, update):
-        await update.message.reply_text("⛔ Este bot es privado.")
-        return
-
     con = context.application.bot_data["db"]
-    user = dbmod.get_or_create_user(con, update.effective_user.id, update.effective_user.full_name)
+    app = context.application
 
-    args = context.args or []
-    cfg = dbmod.get_config(con, user.id)
-
-    if len(args) == 0:
-        if not cfg:
-            await update.message.reply_text(
-                "No tienes configuración aún. Usa:\n/config 08:00 14:00 21:30"
-            )
-            return
-        await update.message.reply_text(
-            "🕒 Horarios actuales:\n"
-            f"• Mañana: {cfg.hora_manana}\n"
-            f"• Tarde: {cfg.hora_tarde}\n"
-            f"• Noche: {cfg.hora_noche}\n\n"
-            "Para cambiar:\n/config 08:00 14:00 21:30"
-        )
+    if not is_owner(update, settings.owner_telegram_user_id):
         return
 
-    if len(args) != 3:
-        await update.message.reply_text("Formato: /config 08:00 14:00 21:30")
+    user = update.effective_user
+    chat = update.effective_chat
+    user_id = dbmod.get_user_id(con, user.id)
+    if not user_id:
+        user_id = dbmod.upsert_user(con, user.id, chat.id, user.full_name or "Juan David")
+
+    text = update.message.text or ""
+    payload = text.replace("/rem_add", "", 1).strip()
+    if not payload:
+        await update.message.reply_text("Uso: /rem_add <SCHEDULE> <NOMBRE> | <MENSAJE>")
         return
 
-    for a in args:
-        if not parse_hhmm(a):
-            await update.message.reply_text(f"Hora inválida: {a}. Usa HH:MM (ej: 08:00)")
-            return
+    if "|" not in payload:
+        await update.message.reply_text("Falta '|'. Ej: /rem_add WEEKDAY@23:00 Dormir | Hora de dormir 😴")
+        return
 
-    dbmod.upsert_config(con, user.id, args[0], args[1], args[2])
-    cfg = dbmod.get_config(con, user.id)
+    left, message = [p.strip() for p in payload.split("|", 1)]
+    if not left:
+        await update.message.reply_text("Falta schedule y nombre.")
+        return
 
-    # Reprogramar si ya tenemos chat_id
-    dbmod.set_chat_id(con, update.effective_user.id, update.effective_chat.id)
-    reschedule_user_reminders(
-        context.application,
-        user_id=user.id,
-        chat_id=update.effective_chat.id,
-        times=ReminderTimes(cfg.hora_manana, cfg.hora_tarde, cfg.hora_noche),
-    )
+    parts = left.split()
+    if len(parts) < 2:
+        await update.message.reply_text("Uso: /rem_add <SCHEDULE> <NOMBRE> | <MENSAJE>")
+        return
 
-    await update.message.reply_text(
-        "✅ Listo. Actualicé tus recordatorios:\n"
-        f"• Mañana: {cfg.hora_manana}\n"
-        f"• Tarde: {cfg.hora_tarde}\n"
-        f"• Noche: {cfg.hora_noche}"
-    )
+    schedule = parts[0].strip()
+    name = " ".join(parts[1:]).strip()
+    if not name:
+        await update.message.reply_text("Falta el nombre del recordatorio.")
+        return
 
+    try:
+        remmod.parse_schedule(schedule)  # valida
+    except Exception as e:
+        await update.message.reply_text(f"Schedule inválido: {e}")
+        return
+
+    rid = dbmod.create_reminder(con, user_id, name=name, message=message, schedule=schedule, timezone="America/Bogota")
+    row = dbmod.get_reminder(con, user_id, rid)
+    remmod.schedule_one(app, con, row, chat.id)
+
+    await update.message.reply_text(f"✅ Recordatorio creado (id={rid}).")
+
+
+async def cmd_rem_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = context.application.bot_data["settings"]
+    con = context.application.bot_data["db"]
+    app = context.application
+
+    if not is_owner(update, settings.owner_telegram_user_id):
+        return
+
+    user = update.effective_user
+    user_id = dbmod.get_user_id(con, user.id)
+    if not user_id:
+        await update.message.reply_text("Primero usa /start.")
+        return
+
+    reminders = dbmod.list_reminders(con, user_id, only_active=False)
+    if not reminders:
+        await update.message.reply_text("No tienes recordatorios aún. Usa /rem_add.")
+        return
+
+    lines = []
+    for r in reminders:
+        rid = r["id"]
+        active = "ON" if int(r["active"]) == 1 else "OFF"
+        schedule = r["schedule"]
+        name = r["name"]
+
+        jid = remmod.job_id_for(user_id, rid)
+        job = app.job_queue.scheduler.get_job(jid)
+        next_run = None
+        if job and job.next_run_time:
+            try:
+                next_run = job.next_run_time.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                next_run = str(job.next_run_time)
+
+        lines.append(f"- id={rid} [{active}] {name} | {schedule}" + (f" | next: {next_run}" if next_run else ""))
+
+    await update.message.reply_text("📌 Tus recordatorios:\n" + "\n".join(lines))
+
+
+async def cmd_rem_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _rem_toggle(update, context, active=0)
+
+
+async def cmd_rem_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _rem_toggle(update, context, active=1)
+
+
+async def _rem_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, active: int) -> None:
+    settings = context.application.bot_data["settings"]
+    con = context.application.bot_data["db"]
+    app = context.application
+
+    if not is_owner(update, settings.owner_telegram_user_id):
+        return
+
+    user = update.effective_user
+    chat = update.effective_chat
+    user_id = dbmod.get_user_id(con, user.id)
+    if not user_id:
+        await update.message.reply_text("Primero usa /start.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Uso: /rem_on <id>  ó  /rem_off <id>")
+        return
+
+    rid = int(context.args[0])
+
+    ok = dbmod.update_reminder_active(con, user_id, rid, active)
+    if not ok:
+        await update.message.reply_text("No encontré ese recordatorio.")
+        return
+
+    if active == 1:
+        row = dbmod.get_reminder(con, user_id, rid)
+        remmod.schedule_one(app, con, row, chat.id)
+        await update.message.reply_text("✅ Activado.")
+    else:
+        remmod.unschedule_one(app, user_id, rid)
+        await update.message.reply_text("🛑 Desactivado.")
+
+
+async def cmd_rem_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = context.application.bot_data["settings"]
+    con = context.application.bot_data["db"]
+    app = context.application
+
+    if not is_owner(update, settings.owner_telegram_user_id):
+        return
+
+    user = update.effective_user
+    user_id = dbmod.get_user_id(con, user.id)
+    if not user_id:
+        await update.message.reply_text("Primero usa /start.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Uso: /rem_del <id>")
+        return
+
+    rid = int(context.args[0])
+
+    remmod.unschedule_one(app, user_id, rid)
+    ok = dbmod.delete_reminder(con, user_id, rid)
+    await update.message.reply_text("🗑️ Eliminado." if ok else "No encontré ese recordatorio.")
+
+
+async def cmd_rem_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = context.application.bot_data["settings"]
+    con = context.application.bot_data["db"]
+    app = context.application
+
+    if not is_owner(update, settings.owner_telegram_user_id):
+        return
+
+    user = update.effective_user
+    chat = update.effective_chat
+    user_id = dbmod.get_user_id(con, user.id)
+    if not user_id:
+        await update.message.reply_text("Primero usa /start.")
+        return
+
+    now = datetime.now(TZ) + timedelta(minutes=2)
+    schedule = f"ONCE@{now.strftime('%Y-%m-%d')}@{now.strftime('%H:%M')}"
+    rid = dbmod.create_reminder(con, user_id, name="Test", message="✅ Recordatorio de prueba", schedule=schedule)
+    row = dbmod.get_reminder(con, user_id, rid)
+    remmod.schedule_one(app, con, row, chat.id)
+
+    await update.message.reply_text(f"🧪 Test creado (id={rid}) para {now.strftime('%H:%M')}.")
+
+
+# ---------------- Existing MVP: tasks/notes ----------------
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
-    if not is_owner(settings, update):
-        await update.message.reply_text("⛔ Este bot es privado.")
+    con = context.application.bot_data["db"]
+
+    if not is_owner(update, settings.owner_telegram_user_id):
         return
 
-    con = context.application.bot_data["db"]
-    user = dbmod.get_or_create_user(con, update.effective_user.id, update.effective_user.full_name)
+    user = update.effective_user
+    user_id = dbmod.get_user_id(con, user.id)
+    if not user_id:
+        await update.message.reply_text("Primero usa /start.")
+        return
 
-    tasks, notes = dbmod.fetch_all_for_export(con, user.id)
-    f = build_export_csv(tasks, notes)
-    await update.message.reply_document(document=f, filename=f.name, caption="📦 Export CSV (tareas + notas)")
+    filepath, filename = export_user_data_to_csv(con, user_id)
+    await update.message.reply_document(document=open(filepath, "rb"), filename=filename)
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
-    if not is_owner(settings, update):
-        return
-
-    text = (update.message.text or "").strip()
-    parsed = parse_message(text)
-
     con = context.application.bot_data["db"]
-    user = dbmod.get_or_create_user(con, update.effective_user.id, update.effective_user.full_name)
 
-    now_local = datetime.now(TZ)
-    today = now_local.date()
-    tomorrow = (now_local + timedelta(days=1)).date()
-
-    if not parsed:
-        await update.message.reply_text(
-            "No te entendí 🙈\n\n"
-            "Prueba así:\n"
-            "• Pendiente: ...\n"
-            "• Hice: ...\n"
-            "• Nota: ...\n"
-            "• Mañana: ...\n"
-            "• Resumen | Pendientes | Hechos hoy\n"
-            "• Buscar: palabra"
-        )
+    if not is_owner(update, settings.owner_telegram_user_id):
         return
 
-    if parsed.kind == "pendiente":
-        dbmod.add_task(con, user.id, today, parsed.payload)
+    user = update.effective_user
+    chat = update.effective_chat
+    user_id = dbmod.get_user_id(con, user.id)
+    if not user_id:
+        user_id = dbmod.upsert_user(con, user.id, chat.id, user.full_name or "Juan David")
+
+    msg = (update.message.text or "").strip()
+    low = msg.lower()
+
+    today = date.today().isoformat()
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    now_iso = datetime.now().isoformat(timespec="seconds")
+
+    if low.startswith("pendiente:"):
+        text = msg.split(":", 1)[1].strip()
+        dbmod.add_task(con, user_id, today, text)
         await update.message.reply_text("✅ Listo, lo guardé como pendiente para hoy.")
         return
 
-    if parsed.kind == "manana":
-        dbmod.add_task(con, user.id, tomorrow, parsed.payload)
+    if low.startswith("mañana:") or low.startswith("manana:"):
+        text = msg.split(":", 1)[1].strip()
+        dbmod.add_task(con, user_id, tomorrow, text)
         await update.message.reply_text("✅ Listo, lo guardé como pendiente para mañana.")
         return
 
-    if parsed.kind == "hice":
-        dbmod.mark_done_or_create(con, user.id, today, parsed.payload)
-        await update.message.reply_text("✅ Perfecto, marcado como hecho hoy.")
+    if low.startswith("hice:"):
+        text = msg.split(":", 1)[1].strip()
+        ok = dbmod.mark_task_done_by_text(con, user_id, text)
+        await update.message.reply_text("✅ Marcado como hecho." if ok else "No encontré ese pendiente exacto. ¿Lo guardo como nota?")
         return
 
-    if parsed.kind == "nota":
-        dbmod.add_note(con, user.id, now_local.isoformat(timespec="seconds"), parsed.payload)
-        await update.message.reply_text("📝 Listo, guardé la nota.")
+    if low.startswith("nota:"):
+        text = msg.split(":", 1)[1].strip()
+        dbmod.add_note(con, user_id, now_iso, text)
+        await update.message.reply_text("📝 Nota guardada.")
         return
 
-    if parsed.kind == "pendientes":
-        pendientes = dbmod.list_tasks(con, user.id, today, "pendiente", limit=20)
-        if not pendientes:
-            await update.message.reply_text("🎉 No tienes pendientes para hoy.")
+    if low == "pendientes":
+        pend = dbmod.list_tasks(con, user_id, today, "pending")
+        if not pend:
+            await update.message.reply_text("No tienes pendientes para hoy.")
             return
-        msg = "📌 Pendientes de hoy:\n" + "\n".join([f"• {t}" for t in pendientes])
-        await update.message.reply_text(msg)
+        out = "\n".join([f"- {t['text']}" for t in pend])
+        await update.message.reply_text("📌 Pendientes de hoy:\n" + out)
         return
 
-    if parsed.kind == "hechos_hoy":
-        hechos = dbmod.list_tasks(con, user.id, today, "hecho", limit=20)
-        if not hechos:
-            await update.message.reply_text("Aún no hay hechos hoy. Puedes registrar con: Hice: ...")
+    if low == "hechos hoy":
+        done = dbmod.list_tasks(con, user_id, today, "done")
+        if not done:
+            await update.message.reply_text("Aún no hay hechos hoy.")
             return
-        msg = "✅ Hechos de hoy:\n" + "\n".join([f"• {t}" for t in hechos])
-        await update.message.reply_text(msg)
+        out = "\n".join([f"- {t['text']}" for t in done])
+        await update.message.reply_text("✅ Hechos de hoy:\n" + out)
         return
 
-    if parsed.kind == "buscar":
-        res = dbmod.search_everything(con, user.id, parsed.payload, limit=20)
-        if not res["tareas"] and not res["notas"]:
-            await update.message.reply_text("No encontré nada con esa palabra.")
-            return
-        parts = []
-        if res["tareas"]:
-            parts.append("🔎 Tareas:\n" + "\n".join([f"• {x}" for x in res["tareas"]]))
-        if res["notas"]:
-            parts.append("🗒️ Notas:\n" + "\n".join([f"• {x}" for x in res["notas"]]))
-        await update.message.reply_text("\n\n".join(parts))
+    if low == "resumen":
+        pend = dbmod.list_tasks(con, user_id, today, "pending")
+        done = dbmod.list_tasks(con, user_id, today, "done")
+        notes = dbmod.list_notes_by_date(con, user_id, today)
+        text = "📊 Resumen de hoy\n\n"
+        text += "✅ Hechos:\n" + ("\n".join([f"- {t['text']}" for t in done]) if done else "- (ninguno)") + "\n\n"
+        text += "📌 Pendientes:\n" + ("\n".join([f"- {t['text']}" for t in pend]) if pend else "- (ninguno)") + "\n\n"
+        text += "📝 Notas:\n" + ("\n".join([f"- {n['text']}" for n in notes]) if notes else "- (ninguna)")
+        await update.message.reply_text(text)
         return
 
-    if parsed.kind == "resumen":
-        pendientes = dbmod.list_tasks(con, user.id, today, "pendiente", limit=10)
-        hechos = dbmod.list_tasks(con, user.id, today, "hecho", limit=10)
-        notas = dbmod.list_notes_today(con, user.id, today, limit=10)
-
-        msg = [f"📅 Resumen de hoy ({today.isoformat()})"]
-        msg.append("")
-        msg.append("✅ Hechos:" if hechos else "✅ Hechos: (ninguno)")
-        if hechos:
-            msg.extend([f"• {t}" for t in hechos])
-
-        msg.append("")
-        msg.append("📌 Pendientes:" if pendientes else "📌 Pendientes: (ninguno)")
-        if pendientes:
-            msg.extend([f"• {t}" for t in pendientes])
-
-        msg.append("")
-        msg.append("📝 Notas:" if notas else "📝 Notas: (ninguna)")
-        if notas:
-            msg.extend([f"• {t}" for t in notas])
-
-        await update.message.reply_text("\n".join(msg))
+    if low.startswith("buscar:"):
+        needle = msg.split(":", 1)[1].strip()
+        res = dbmod.search_all(con, user_id, needle)
+        lines = []
+        if res["tasks"]:
+            lines.append("📌 Tareas:")
+            lines.extend([f"- {t['target_date']} [{t['status']}] {t['text']}" for t in res["tasks"]])
+        if res["notes"]:
+            lines.append("\n📝 Notas:")
+            lines.extend([f"- {n['note_datetime']} {n['text']}" for n in res["notes"]])
+        await update.message.reply_text("\n".join(lines) if lines else "No encontré coincidencias.")
         return
+
+    # fallback
+    await update.message.reply_text("No entendí. Usa: Pendiente:, Hice:, Nota:, Resumen, Pendientes, Hechos hoy, Buscar: palabra")
 
 
 def main() -> None:
     settings = get_settings()
-
-    # DB
     con = dbmod.connect(settings.db_path)
     dbmod.init_db(con)
 
-    defaults = Defaults(tzinfo=TZ)  # para que el bot “piense” en Bogota
+    defaults = Defaults(tzinfo=TZ)
 
     app = (
         ApplicationBuilder()
-        .token(settings.token)
+        .token(settings.telegram_bot_token)
         .defaults(defaults)
-        .job_queue(JobQueue())  # requiere instalar python-telegram-bot[job-queue] :contentReference[oaicite:2]{index=2}
         .build()
     )
 
+    app.add_error_handler(on_error)
+
+    # Guardar settings y db en app
     app.bot_data["settings"] = settings
     app.bot_data["db"] = con
 
+    # handlers
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    app.add_handler(CommandHandler("rem_add", cmd_rem_add))
+    app.add_handler(CommandHandler("rem_list", cmd_rem_list))
+    app.add_handler(CommandHandler("rem_on", cmd_rem_on))
+    app.add_handler(CommandHandler("rem_off", cmd_rem_off))
+    app.add_handler(CommandHandler("rem_del", cmd_rem_del))
+    app.add_handler(CommandHandler("rem_test", cmd_rem_test))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Programar recordatorios existentes
+    remmod.schedule_all_active(app, con)
 
     log.info("Bot iniciado. Polling local...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
