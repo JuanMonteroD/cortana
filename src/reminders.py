@@ -180,8 +180,9 @@ def schedule_one(app: Application, con, reminder_row: dict, chat_id: int, misfir
         max_instances=1,
     )
 
-    next_run = job.next_run_time.isoformat() if job.next_run_time else None
-    dbmod.update_reminder_run_times(con, rid, last_run_at=None, next_run_at=next_run)
+    # En algunos entornos (Termux) el scheduler aún no ha iniciado y Job no tiene next_run_time.
+    # Lo dejamos en NULL y luego lo calculamos cuando el scheduler esté corriendo.
+    dbmod.update_reminder_run_times(con, rid, last_run_at=None, next_run_at=None)
 
 
 def unschedule_one(app: Application, user_id: int, reminder_id: int) -> None:
@@ -234,5 +235,6 @@ async def _run_reminder_async(app: Application, con, reminder_id: int, chat_id: 
     # si es recurrente, actualizar next_run_at desde scheduler
     jid = job_id_for(int(row["user_id"]), int(row["id"]))
     job = app.job_queue.scheduler.get_job(jid)
-    next_run = job.next_run_time.isoformat() if (job and job.next_run_time) else None
+    next_run_dt = getattr(job, "next_run_time", None) if job else None
+    next_run = next_run_dt.isoformat() if next_run_dt else None
     dbmod.update_reminder_run_times(con, int(row["id"]), last_run_at=last, next_run_at=next_run)
