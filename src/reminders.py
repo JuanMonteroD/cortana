@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timedelta, timezone as dt_timezone
-from typing import Optional, Tuple
+from datetime import datetime, timezone as dt_timezone
+from typing import Optional
 
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from telegram.ext import Application
-
 from zoneinfo import ZoneInfo
 
 import db as dbmod
 from parser import parse_hhmm, parse_yyyy_mm_dd
 
+log = logging.getLogger("cortana.reminders")
 
 DAY_TOKENS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 WEEKDAY_DOW = "mon,tue,wed,thu,fri"
@@ -145,10 +146,29 @@ def schedule_one(app: Application, con, reminder_row: dict, chat_id: int, misfir
     trigger = build_trigger(parsed, reminder_row.get("timezone") or "America/Bogota")
 
     def _runner():
-        # APScheduler puede llamar funciones sync; aquí creamos task async
-        app.create_task(_run_reminder_async(app, con, rid, chat_id))
+        loop = app.bot_data.get("loop")
 
-    # add/replace
+        if loop is None:
+            # fallback (muy raro)
+            try:
+                app.create_task(_run_reminder_async(app, con, rid, chat_id))
+            except RuntimeError as e:
+                log.error("No hay event loop disponible: %s", e)
+            return
+
+        fut = asyncio.run_coroutine_threadsafe(
+            _run_reminder_async(app, con, rid, chat_id),
+            loop,
+        )
+
+        def _done_callback(f):
+            try:
+                f.result()
+            except Exception as ex:
+                log.exception("Error ejecutando reminder async: %s", ex)
+
+        fut.add_done_callback(_done_callback)
+
     job = scheduler.add_job(
         _runner,
         trigger=trigger,
@@ -160,7 +180,6 @@ def schedule_one(app: Application, con, reminder_row: dict, chat_id: int, misfir
         max_instances=1,
     )
 
-    # Guardar next_run_at si se puede
     next_run = job.next_run_time.isoformat() if job.next_run_time else None
     dbmod.update_reminder_run_times(con, rid, last_run_at=None, next_run_at=next_run)
 

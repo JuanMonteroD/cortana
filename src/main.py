@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+
 from datetime import datetime, timedelta, date
 from pathlib import Path
 
@@ -41,6 +43,9 @@ def is_owner(update: Update, owner_id: int) -> bool:
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Ocurrió un error:", exc_info=context.error)
 
+async def post_init(app):
+    # Guardamos el loop REAL donde corre el bot
+    app.bot_data["loop"] = asyncio.get_running_loop()
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
@@ -383,6 +388,7 @@ def main() -> None:
         ApplicationBuilder()
         .token(settings.telegram_bot_token)
         .defaults(defaults)
+        .post_init(post_init)
         .build()
     )
 
